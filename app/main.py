@@ -39,7 +39,7 @@ def generate_structured_story(story_arc: str) -> dict:
 
     This function builds a chain that:
     1. Takes a system prompt to define the task and output format.
-    2. Takes a human prompt (the user's story arc).
+    2. Takes a human prompt (the user's storsy arc).
     3. Sends the combined prompt to the LLM.
     4. Parses the LLM's JSON string output into a Python dictionary.
 

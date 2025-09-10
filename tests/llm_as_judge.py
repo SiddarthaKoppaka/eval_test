@@ -7,7 +7,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.pydantic_v1 import BaseModel, Field, validator
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 
-from main import generate_structured_story
+from app.main import generate_structured_story
 
 load_dotenv()
 
@@ -44,8 +44,8 @@ parser = JsonOutputParser(pydantic_object=EvalScores)
 
 # ---- Prompts (no raw JSON braces in the template!) ----
 EVAL_SYSTEM = (
-    "You are an intelligent LLM Response Evaluator. Evaluate the story model's response "
-    "against the original user query. Check for Hallucinations, Relevancy, and Completeness.\n\n"
+    "You are an intelligent LLM Response Evaluator. Evaluate the story model's response"
+    "against the original user query. Check for Hallucinations, Relevancy, and Completeness.\n\n Follow the Output Format Instructions Strictly"
     "{format_instructions}"
 )
 
@@ -77,15 +77,5 @@ def evaluate_answer(user_query: str) -> dict:
     result: EvalScores = judge_chain.invoke({"user_query": user_query})
     return result
 
-# Optional: evaluate an already-generated response
-direct_eval_chain = eval_prompt | llm_judge | parser
-
-def evaluate_provided_answer(user_query: str, story_response: str) -> dict:
-    result: EvalScores = direct_eval_chain.invoke(
-        {"user_query": user_query, "story_response": story_response}
-    )
-    return result
-
-
-q = " a time-traveling botanist discovering an extinct flower."
-print(evaluate_answer(q))
+# q = " a time-traveling botanist discovering an extinct flower."
+# print(evaluate_answer(q))
