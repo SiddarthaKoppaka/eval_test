@@ -1,0 +1,89 @@
+from typing import List, Dict, Any
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.schema import Document
+
+# ---------- Prompt ----------
+ANSWER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a helpful assistant. Answer the user's question using ONLY the provided context. "
+     "If the answer is not in the context, say you don't know.\n\n"
+     "Constraints:\n"
+     "- Be concise.\n"
+     "- Cite sources by number like [1], [2] based on the order of the context snippets.\n"),
+    ("human",
+     "Context (numbered):\n{context}\n\n"
+     "Question: {question}\n\n"
+     "Answer:")
+])
+
+def format_context(docs: List[Document]) -> str:
+    """Make a clean, numbered context block and keep source mapping."""
+    lines = []
+    for i, d in enumerate(docs, start=1):
+        content = d.page_content.strip()
+        # Try to include quick provenance
+        meta = d.metadata or {}
+        src = meta.get("source") or meta.get("file_path") or meta.get("uri") or meta.get("id") or "unknown"
+        lines.append(f"[{i}] {content}\n(Source: {src})")
+    return "\n\n".join(lines)
+
+def run_retrieval_chain(
+    retriever,
+    llm,
+    question: str,
+    k: int = 4
+) -> Dict[str, Any]:
+    # 1) Retrieve
+    docs = retriever.get_relevant_documents(question)[:k]
+
+    # 2) Format context
+    context_str = format_context(docs)
+
+    # 3) Render prompt messages
+    rendered = ANSWER_PROMPT.format_messages(context=context_str, question=question)
+
+    # 4) Call LLM (ChatBedrock supports .invoke on message lists)
+    llm_output = llm.invoke(rendered)
+
+    # 5) Build response payload
+    answer_text = getattr(llm_output, "content", str(llm_output))
+
+    sources = []
+    for i, d in enumerate(docs, start=1):
+        md = d.metadata or {}
+        sources.append({
+            "index": i,
+            "source": md.get("source") or md.get("file_path") or md.get("uri") or md.get("id") or "unknown",
+            "metadata": md
+        })
+
+    # Also return the *exact* prompt that was sent (as a string for logging/debug)
+    # We’ll join role-tagged messages for readability.
+    rendered_str = "\n\n".join(
+        f"{m.type.upper()}:\n{m.content}" for m in rendered
+    )
+
+    return {
+        "answer": answer_text,
+        "prompt": rendered_str,
+        "sources": sources,
+    }
+
+
+
+
+class AskRequest(BaseModel):
+    input: str
+    k: int = 4
+
+class AskResponse(BaseModel):
+    answer: str
+    prompt: str
+    sources: List[Dict[str, Any]]
+
+@app.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest):
+    retriever = get_retriever(req.k)
+    llm = get_llm()
+    result = run_retrieval_chain(retriever, llm, question=req.input, k=req.k)
+    return AskResponse(**result)
