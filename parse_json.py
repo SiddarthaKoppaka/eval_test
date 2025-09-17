@@ -1,78 +1,84 @@
-import requests, json
+import requests
+import json
 
-def post_stream_text_then_metadata(
-    url: str,
-    payload: dict,
-    *,
-    headers: dict | None = None,
-    timeout: int = 600,
-    metadata_must_start_on_newline: bool = True,
-):
+def get_answers(payload, api_url, headers=None, timeout=60):
     """
-    Sends JSON payload to a streaming endpoint and reads the response incrementally.
-    Collects all text until the first complete top-level JSON object is encountered.
-    Returns (text, metadata) where metadata is a dict (if JSON parsed) or a raw string.
+    POSTs payload to api_url and reads a streaming response.
+    Returns only the generated text (metadata is ignored).
+    Works with:
+      - raw text chunks
+      - SSE lines starting with 'data:'
+      - JSON chunks like {'text': '...'} or {'delta': {'text':'...'}}
+    Falls back to non-stream JSON/text if streaming isn't used.
+    """
+    base_headers = {
+        "Accept": "text/event-stream, application/json;q=0.9, */*;q=0.8",
+        "Content-Type": "application/json",
+    }
+    if headers:
+        base_headers.update(headers)
 
-    If metadata_must_start_on_newline=True, the parser only treats a '{' that appears
-    at the start of the stream or immediately after a newline as the metadata start.
-    """
-    with requests.post(url, json=payload, stream=True, headers=headers, timeout=timeout) as r:
+    with requests.post(api_url, json=payload, headers=base_headers, stream=True, timeout=timeout) as r:
         r.raise_for_status()
 
-        text_buf = []        # all text before metadata
-        in_meta = False
-        meta_buf = []        # chars of the metadata JSON
-        depth = 0
-        in_str = False
-        esc = False
-        prev_char = "\n"     # treat start as if preceded by newline
+        parts = []
+        metadata_started = False
 
-        # We build text in a single buffer until we see metadata.
-        # Once we enter metadata mode, we track JSON strings/escapes/braces until depth returns to 0.
-        for chunk in r.iter_content(chunk_size=8192, decode_unicode=True):
-            if not chunk:
+        # Stream line-by-line (robust for SSE and newline-delimited JSON)
+        for raw in r.iter_lines(decode_unicode=True):
+            if raw is None:
+                continue
+            line = raw.strip()
+            if not line:
                 continue
 
-            for ch in chunk:
-                if not in_meta:
-                    is_meta_start = (ch == "{") and (
-                        not metadata_must_start_on_newline or prev_char == "\n"
-                    )
-                    if is_meta_start:
-                        # switch to metadata mode; do NOT include '{' in text
-                        in_meta = True
-                        meta_buf.append("{")
-                        depth = 1
-                        in_str = False
-                        esc = False
-                    else:
-                        text_buf.append(ch)
-                else:
-                    meta_buf.append(ch)
-                    if in_str:
-                        if esc:
-                            esc = False
-                        elif ch == "\\":
-                            esc = True
-                        elif ch == '"':
-                            in_str = False
-                    else:
-                        if ch == '"':
-                            in_str = True
-                        elif ch == "{":
-                            depth += 1
-                        elif ch == "}":
-                            depth -= 1
-                            if depth == 0:
-                                # Done: first full JSON object captured
-                                text = "".join(text_buf)
-                                meta_str = "".join(meta_buf).strip()
-                                try:
-                                    meta = json.loads(meta_str)
-                                except Exception:
-                                    meta = meta_str
-                                return text, meta
-                prev_char = ch
+            # Handle SSE prefix
+            if line.startswith("data:"):
+                line = line[5:].lstrip()
+                if not line:
+                    continue
 
-        # Stream ended without a complete metadata object
-        return "".join(text_buf), None
+            # If a JSON object/array starts, try to parse it
+            if line.startswith("{") or line.startswith("["):
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    # Not valid JSON—treat as plain text
+                    if not metadata_started:
+                        parts.append(line)
+                    continue
+
+                # Treat objects with 'metadata' (or JSON lacking any text) as metadata and stop capturing
+                if isinstance(obj, dict):
+                    # Common streaming shapes
+                    if "text" in obj:
+                        parts.append(str(obj["text"]))
+                        continue
+                    if "delta" in obj and isinstance(obj["delta"], dict) and "text" in obj["delta"]:
+                        parts.append(str(obj["delta"]["text"]))
+                        continue
+                    if "metadata" in obj:
+                        metadata_started = True
+                        break
+
+                    # If it's JSON but not text/delta, consider it metadata-ish; ignore it
+                    continue
+
+                # Arrays usually aren’t text tokens—ignore
+                continue
+
+            # Plain text chunk
+            if not metadata_started:
+                parts.append(line)
+
+        # If we got nothing from the stream, try non-stream body
+        if not parts:
+            try:
+                data = r.json()
+                if isinstance(data, dict) and "text" in data:
+                    return str(data["text"])
+                return r.text
+            except Exception:
+                return r.text
+
+        return "".join(parts)
