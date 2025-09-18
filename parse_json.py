@@ -3,82 +3,103 @@ import json
 
 def get_answers(payload, api_url, headers=None, timeout=60):
     """
-    POSTs payload to api_url and reads a streaming response.
-    Returns only the generated text (metadata is ignored).
-    Works with:
-      - raw text chunks
+    Stream a response and return only generated text.
+    Handles:
+      - raw text lines
       - SSE lines starting with 'data:'
-      - JSON chunks like {'text': '...'} or {'delta': {'text':'...'}}
-    Falls back to non-stream JSON/text if streaming isn't used.
+      - JSON chunks: {'text': ...}, {'delta': {'text': ...}},
+        OpenAI-like {'choices':[{'delta':{'content': ...}}]}
+        Anthropic-like {'type':'content_block_delta','delta':{'text': ...}}
+    Reads the body ONCE to avoid 'content already consumed' errors.
     """
     base_headers = {
         "Accept": "text/event-stream, application/json;q=0.9, */*;q=0.8",
         "Content-Type": "application/json",
+        # Optional: nudge servers to stream
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
     }
     if headers:
         base_headers.update(headers)
 
+    collected = []
+    raw_lines = []
+
     with requests.post(api_url, json=payload, headers=base_headers, stream=True, timeout=timeout) as r:
         r.raise_for_status()
 
-        parts = []
-        metadata_started = False
-
-        # Stream line-by-line (robust for SSE and newline-delimited JSON)
         for raw in r.iter_lines(decode_unicode=True):
             if raw is None:
                 continue
+
             line = raw.strip()
             if not line:
                 continue
 
-            # Handle SSE prefix
+            raw_lines.append(line)
+
+            # SSE "data:" prefix
             if line.startswith("data:"):
                 line = line[5:].lstrip()
                 if not line:
                     continue
+                # Some streams send [DONE]
+                if line == "[DONE]":
+                    break
 
-            # If a JSON object/array starts, try to parse it
+            # Try JSON chunk
             if line.startswith("{") or line.startswith("["):
                 try:
                     obj = json.loads(line)
                 except Exception:
-                    # Not valid JSON—treat as plain text
-                    if not metadata_started:
-                        parts.append(line)
+                    # Not valid JSON -> treat as plain text
+                    collected.append(line)
                     continue
 
-                # Treat objects with 'metadata' (or JSON lacking any text) as metadata and stop capturing
-                if isinstance(obj, dict):
-                    # Common streaming shapes
-                    if "text" in obj:
-                        parts.append(str(obj["text"]))
-                        continue
-                    if "delta" in obj and isinstance(obj["delta"], dict) and "text" in obj["delta"]:
-                        parts.append(str(obj["delta"]["text"]))
-                        continue
-                    if "metadata" in obj:
-                        metadata_started = True
-                        break
+                # Common shapes:
 
-                    # If it's JSON but not text/delta, consider it metadata-ish; ignore it
+                # 1) Plain {"text": "..."}
+                if isinstance(obj, dict) and "text" in obj:
+                    if obj["text"]:
+                        collected.append(str(obj["text"]))
                     continue
 
-                # Arrays usually aren’t text tokens—ignore
+                # 2) Plain {"delta":{"text":"..."}}
+                if isinstance(obj, dict) and isinstance(obj.get("delta"), dict) and "text" in obj["delta"]:
+                    if obj["delta"]["text"]:
+                        collected.append(str(obj["delta"]["text"]))
+                    continue
+
+                # 3) OpenAI-like {"choices":[{"delta":{"content":"..."}}], ...}
+                if isinstance(obj, dict) and isinstance(obj.get("choices"), list):
+                    for ch in obj["choices"]:
+                        delta = ch.get("delta") or {}
+                        content = delta.get("content")
+                        if content:
+                            collected.append(str(content))
+                    continue
+
+                # 4) Anthropic-like chunk
+                # {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}, ...}
+                if (
+                    isinstance(obj, dict)
+                    and obj.get("type") == "content_block_delta"
+                    and isinstance(obj.get("delta"), dict)
+                    and "text" in obj["delta"]
+                ):
+                    collected.append(str(obj["delta"]["text"]))
+                    continue
+
+                # If JSON but not a known text-shape, ignore silently
                 continue
 
-            # Plain text chunk
-            if not metadata_started:
-                parts.append(line)
+            # Fallback: treat as plain text line
+            collected.append(line)
 
-        # If we got nothing from the stream, try non-stream body
-        if not parts:
-            try:
-                data = r.json()
-                if isinstance(data, dict) and "text" in data:
-                    return str(data["text"])
-                return r.text
-            except Exception:
-                return r.text
+    # Primary return: aggregated deltas/plain text
+    if collected:
+        return "".join(collected)
 
-        return "".join(parts)
+    # Fallback: if nothing recognized, return the raw body we saw
+    # (No second read attempt—use the buffered lines)
+    return "\n".join(raw_lines)
